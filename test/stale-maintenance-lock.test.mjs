@@ -234,3 +234,44 @@ test("a synchronous body keeps the lock fresh by calling beat()", async () => {
     f.close();
   }
 });
+
+test("a takeover stops beat() and skips prune", async () => {
+  const f = fixture();
+  const opts = { maxAgeMs: 1500, heartbeatMs: 100 };
+  try {
+    await f.maintenance.locked(async () => {
+      // 别人把锁换成了自己的：此后本进程不得再写盘、也不得 prune/gc。
+      fs.writeFileSync(f.lock, "999999:someone-else");
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      assert.throws(() => f.maintenance.beat(), /已被其他进程接管/);
+      assert.equal(f.maintenance.lockLost, true, "接管后必须置位");
+      let pruned = false;
+      f.maintenance.prune = () => {
+        pruned = true;
+        return { removed: [], freed: 0, kept: 0, gc: null, errors: [] };
+      };
+      const warnings = f.maintenance.finishCleanup({ finish() {} }, "");
+      assert.deepEqual(warnings, [{ stage: "prune", code: "LOCK_LOST" }]);
+      assert.equal(pruned, false, "接管后不能 prune/gc");
+      assert.throws(() => f.maintenance.assertOwned(), /已停止写入/);
+    }, opts);
+  } finally {
+    f.close();
+  }
+});
+
+test("a lock that disappears counts as a lost lock", async () => {
+  const f = fixture();
+  const opts = { maxAgeMs: 1500, heartbeatMs: 100 };
+  try {
+    await f.maintenance.locked(async () => {
+      // 被接管后又被正常释放：文件没了，同样等于本进程不再持锁。
+      fs.unlinkSync(f.lock);
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      assert.throws(() => f.maintenance.beat(), /已被其他进程接管/);
+      assert.equal(f.maintenance.lockLost, true);
+    }, opts);
+  } finally {
+    f.close();
+  }
+});
